@@ -1,0 +1,8 @@
+{
+  "name": "FlowForge - Visual Workflow Automation Platform",
+  "description": "Design workflows, automate processes, and track every execution with a visual graph builder and reliable background execution engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

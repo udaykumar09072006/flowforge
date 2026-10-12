@@ -1,0 +1,352 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// -------------------------------------------------------------
+// ENUMS
+// -------------------------------------------------------------
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+enum WorkflowStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ExecutionStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  TIMED_OUT
+}
+
+enum NodeExecutionStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  SKIPPED
+  CANCELLED
+}
+
+enum IdempotencyStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+// -------------------------------------------------------------
+// USER & WORKSPACE MODELS
+// -------------------------------------------------------------
+
+model User {
+  id                       String    @id @default(uuid()) @db.Uuid
+  name                     String
+  email                    String    @unique
+  passwordHash             String
+  emailVerified            Boolean   @default(false)
+  emailVerificationToken   String?
+  emailVerificationExpires DateTime?
+  passwordResetToken       String?
+  passwordResetExpires     DateTime?
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  sessions          Session[]
+  memberships       WorkspaceMember[]
+  createdWorkflows  Workflow[]         @relation("WorkflowCreator")
+  createdVersions   WorkflowVersion[]  @relation("VersionCreator")
+  triggeredRuns     WorkflowRun[]      @relation("RunTriggeredBy")
+  credentials       IntegrationCredential[]
+  auditLogs         AuditLog[]
+
+  @@map("users")
+}
+
+model Session {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @db.Uuid
+  sessionToken String   @unique
+  expiresAt    DateTime
+  userAgent    String?
+  ipAddress    String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([sessionToken])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model Workspace {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  ownerId   String   @db.Uuid
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members     WorkspaceMember[]
+  workflows   Workflow[]
+  credentials IntegrationCredential[]
+  auditLogs   AuditLog[]
+
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @db.Uuid
+  userId      String        @db.Uuid
+  role        WorkspaceRole @default(VIEWER)
+  joinedAt    DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([workspaceId])
+  @@index([userId])
+  @@map("workspace_members")
+}
+
+// -------------------------------------------------------------
+// WORKFLOW & VERSIONING MODELS
+// -------------------------------------------------------------
+
+model Workflow {
+  id                        String         @id @default(uuid()) @db.Uuid
+  workspaceId               String         @db.Uuid
+  name                      String
+  description               String?
+  status                    WorkflowStatus @default(DRAFT)
+  currentDraftVersionId     String?        @db.Uuid
+  latestPublishedVersionId  String?        @db.Uuid
+  createdById               String         @db.Uuid
+  createdAt                 DateTime       @default(now())
+  updatedAt                 DateTime       @updatedAt
+
+  workspace       Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy       User              @relation("WorkflowCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  versions        WorkflowVersion[]
+  runs            WorkflowRun[]
+  webhookEndpoint WebhookEndpoint?
+  schedules       Schedule[]
+
+  @@index([workspaceId])
+  @@index([createdById])
+  @@index([status])
+  @@map("workflows")
+}
+
+model WorkflowVersion {
+  id              String    @id @default(uuid()) @db.Uuid
+  workflowId      String    @db.Uuid
+  versionNumber   Int
+  graphDefinition Json      // Validated JSON containing nodes, edges, configs
+  schemaVersion   Int       @default(1)
+  isPublished     Boolean   @default(false)
+  createdById     String    @db.Uuid
+  createdAt       DateTime  @default(now())
+  publishedAt     DateTime?
+
+  workflow  Workflow      @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  createdBy User          @relation("VersionCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  runs      WorkflowRun[]
+
+  @@unique([workflowId, versionNumber])
+  @@index([workflowId])
+  @@index([workflowId, isPublished])
+  @@map("workflow_versions")
+}
+
+// -------------------------------------------------------------
+// EXECUTION & RUN MODELS
+// -------------------------------------------------------------
+
+model WorkflowRun {
+  id                String          @id @default(uuid()) @db.Uuid
+  workflowId        String          @db.Uuid
+  workflowVersionId String          @db.Uuid
+  triggeredById     String?         @db.Uuid
+  triggerType       String          // manual, webhook, schedule, api
+  status            ExecutionStatus @default(QUEUED)
+  idempotencyKey    String?
+  triggerPayload    Json?
+  errorSummary      String?
+  retryOfRunId      String?         @db.Uuid
+  startedAt         DateTime        @default(now())
+  completedAt       DateTime?
+  durationMs        Int?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  workflow        Workflow          @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  workflowVersion WorkflowVersion   @relation(fields: [workflowVersionId], references: [id], onDelete: Restrict)
+  triggeredBy     User?             @relation("RunTriggeredBy", fields: [triggeredById], references: [id], onDelete: SetNull)
+  nodeExecutions  NodeExecution[]
+
+  @@index([workflowId, createdAt(sort: Desc)])
+  @@index([workflowVersionId])
+  @@index([status])
+  @@index([idempotencyKey])
+  @@map("workflow_runs")
+}
+
+model NodeExecution {
+  id            String              @id @default(uuid()) @db.Uuid
+  workflowRunId String              @db.Uuid
+  nodeId        String
+  nodeType      String
+  status        NodeExecutionStatus @default(PENDING)
+  attemptNumber Int                 @default(1)
+  inputData     Json?
+  outputData    Json?
+  errorCode     String?
+  errorMessage  String?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  durationMs    Int?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  workflowRun WorkflowRun @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+
+  @@unique([workflowRunId, nodeId, attemptNumber])
+  @@index([workflowRunId, nodeId])
+  @@index([status])
+  @@map("node_executions")
+}
+
+// -------------------------------------------------------------
+// TRIGGERS: WEBHOOK & SCHEDULE
+// -------------------------------------------------------------
+
+model WebhookEndpoint {
+  id                  String   @id @default(uuid()) @db.Uuid
+  workflowId          String   @unique @db.Uuid
+  endpointPath        String   @unique
+  secretHash          String   // Hashed representation, never raw secret
+  status              String   @default("ACTIVE") // ACTIVE, REVOKED
+  allowedMethods      String   @default("POST")   // Comma separated or single method
+  rateLimitPerMinute  Int      @default(60)
+  callCount           Int      @default(0)
+  lastTriggeredAt     DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([endpointPath])
+  @@map("webhook_endpoints")
+}
+
+model Schedule {
+  id             String    @id @default(uuid()) @db.Uuid
+  workflowId     String    @db.Uuid
+  cronExpression String
+  timezone       String    @default("UTC")
+  status         String    @default("ACTIVE") // ACTIVE, PAUSED
+  nextRunAt      DateTime?
+  lastRunAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([workflowId])
+  @@index([status, nextRunAt])
+  @@map("schedules")
+}
+
+// -------------------------------------------------------------
+// INTEGRATION CREDENTIALS & AUDIT LOGS
+// -------------------------------------------------------------
+
+model IntegrationCredential {
+  id              String   @id @default(uuid()) @db.Uuid
+  workspaceId     String   @db.Uuid
+  provider        String   // smtp, http_auth, aws, slack, custom
+  displayName     String
+  encryptedSecret String   // AES-256-GCM cipher text
+  keyVersion      Int      @default(1)
+  status          String   @default("ACTIVE")
+  createdById     String   @db.Uuid
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User      @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([workspaceId])
+  @@map("integration_credentials")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  workspaceId  String   @db.Uuid
+  actorUserId  String?  @db.Uuid
+  action       String   // WORKFLOW_PUBLISHED, CREDENTIAL_CREATED, etc.
+  resourceType String
+  resourceId   String
+  safeMetadata Json     // Scrubbed metadata, strictly free of secrets
+  createdAt    DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actor     User?     @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt(sort: Desc)])
+  @@index([resourceType, resourceId])
+  @@map("audit_logs")
+}
+
+// -------------------------------------------------------------
+// RELIABILITY: IDEMPOTENCY & TRANSACTIONAL OUTBOX
+// -------------------------------------------------------------
+
+model IdempotencyRecord {
+  id             String            @id @default(uuid()) @db.Uuid
+  scope          String            // e.g. "workflow_run", "webhook_event"
+  idempotencyKey String
+  requestHash    String
+  status         IdempotencyStatus @default(PENDING)
+  responseData   Json?
+  resourceId     String?
+  createdAt      DateTime          @default(now())
+  expiresAt      DateTime
+
+  @@unique([scope, idempotencyKey])
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
+
+model OutboxEvent {
+  id            String    @id @default(uuid()) @db.Uuid
+  eventType     String    // WORKFLOW_RUN_REQUESTED, SCHEDULE_TICK, etc.
+  aggregateType String    // WorkflowRun, Schedule
+  aggregateId   String
+  payload       Json
+  createdAt     DateTime  @default(now())
+  processedAt   DateTime?
+  attemptCount  Int       @default(0)
+  lastError     String?
+
+  @@index([processedAt, createdAt])
+  @@map("outbox_events")
+}
